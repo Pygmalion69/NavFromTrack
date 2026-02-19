@@ -1,3 +1,5 @@
+# NavFromTrack
+
 # GPX + OSM to Mapbox/MapLibre Directions JSON
 
 Offline converter for creating a Mapbox Directions API-style route JSON from:
@@ -50,4 +52,3 @@ Emits a single Mapbox route object with:
 - step/route geometry encoded per `--geometries`
 
 This is intended for Android ingestion via `DirectionsRoute.fromJson(...)`.
-# NavFromTrack
