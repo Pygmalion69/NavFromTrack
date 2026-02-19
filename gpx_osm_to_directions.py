@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
+"""
+GPX + OSM -> Mapbox/MapLibre DirectionsRoute JSON.
+
+Some upstream data paths can leave literal "\\xH"/"\\xHH" sequences in geometry strings,
+which breaks Mapbox polyline decoding on Android. This script sanitizes both the
+top-level route geometry and every step geometry by converting "\\xHH" to the
+corresponding character before JSON serialization.
+"""
 import argparse
 import csv
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -457,6 +466,212 @@ def default_speed(profile: str) -> float:
     return {"car": 30.0, "bike": 18.0, "foot": 5.0}[profile]
 
 
+def coords_for_range(points: List[Tuple[float, float]], start_idx: int, end_idx: int) -> List[Tuple[float, float]]:
+    coords = points[start_idx : end_idx + 1]
+    if len(coords) >= 2:
+        return coords
+    if start_idx > 0:
+        return [points[start_idx - 1], points[start_idx]]
+    if end_idx + 1 < len(points):
+        return [points[end_idx], points[end_idx + 1]]
+    return [points[0], points[-1]]
+
+
+def intersection_for(
+    man_type: str,
+    location: List[float],
+    bearing_before: Optional[int],
+    bearing_after: Optional[int],
+) -> Dict:
+    if man_type == "depart":
+        bearings = [int(bearing_after)] if bearing_after is not None else []
+        inter = {"location": location, "bearings": bearings, "entry": [True] * len(bearings)}
+        if bearings:
+            inter["out"] = 0
+        return inter
+    if man_type == "arrive":
+        return {"location": location, "bearings": [], "entry": []}
+
+    bearings: List[int] = []
+    if bearing_before is not None:
+        bearings.append(int(bearing_before))
+    if bearing_after is not None:
+        bearings.append(int(bearing_after))
+    inter = {"location": location, "bearings": bearings, "entry": [True] * len(bearings)}
+    if len(bearings) >= 2:
+        inter["in"] = 0
+        inter["out"] = 1
+    elif len(bearings) == 1:
+        inter["out"] = 0
+    return inter
+
+
+def build_step(
+    points: List[Tuple[float, float]],
+    start_idx: int,
+    end_idx: int,
+    mode: str,
+    speed_kmh: float,
+    geometries: str,
+    man_type: str,
+    modifier: Optional[str],
+    bearing_before: Optional[int],
+    bearing_after: Optional[int],
+    location: List[float],
+    instruction: str,
+    name: str,
+) -> Dict:
+    coords = coords_for_range(points, start_idx, end_idx)
+    distance_m = point_distance_sum(coords, 0, len(coords) - 1)
+    duration_s = distance_m / (speed_kmh * 1000.0 / 3600.0)
+
+    maneuver = {
+        "type": man_type,
+        "location": location,
+        "instruction": instruction,
+    }
+    if modifier is not None:
+        maneuver["modifier"] = modifier
+    if bearing_before is not None:
+        maneuver["bearing_before"] = int(bearing_before)
+    if bearing_after is not None:
+        maneuver["bearing_after"] = int(bearing_after)
+
+    return {
+        "distance": distance_m,
+        "duration": duration_s,
+        "weight": duration_s,
+        "name": name,
+        "mode": mode,
+        "driving_side": "right",
+        "geometry": geometry_for(coords, geometries),
+        "maneuver": maneuver,
+        "intersections": [intersection_for(man_type, location, bearing_before, bearing_after)],
+        "_coords_latlon": coords,
+    }
+
+
+def merge_continue_steps(steps: List[Dict], geometries: str, merge_below_m: float) -> List[Dict]:
+    if merge_below_m <= 0:
+        return steps
+
+    merged: List[Dict] = []
+    for step in steps:
+        if not merged:
+            merged.append(step)
+            continue
+        prev = merged[-1]
+        prev_man = prev.get("maneuver", {})
+        cur_man = step.get("maneuver", {})
+        same_name = (prev.get("name") or "") == (step.get("name") or "")
+        both_continue = prev_man.get("type") == "continue" and cur_man.get("type") == "continue"
+        if both_continue and same_name and (float(prev["distance"]) + float(step["distance"]) < merge_below_m):
+            prev["distance"] = float(prev["distance"]) + float(step["distance"])
+            prev["duration"] = float(prev["duration"]) + float(step["duration"])
+            prev["weight"] = float(prev["weight"]) + float(step["weight"])
+
+            prev_coords = prev.get("_coords_latlon", [])
+            cur_coords = step.get("_coords_latlon", [])
+            if prev_coords and cur_coords and prev_coords[-1] == cur_coords[0]:
+                merged_coords = prev_coords + cur_coords[1:]
+            else:
+                merged_coords = prev_coords + cur_coords
+            prev["_coords_latlon"] = merged_coords
+            prev["geometry"] = geometry_for(merged_coords, geometries)
+        else:
+            merged.append(step)
+    return merged
+
+
+def validate_polyline_string(value: str, label: str) -> None:
+    for ch in value:
+        if ord(ch) < 32:
+            raise ValueError(f"Invalid control character in {label}")
+
+
+def validate_no_invalid_hex_escape(serialized_json: str) -> None:
+    i = 0
+    n = len(serialized_json)
+    while i < n:
+        if serialized_json[i] != "\\":
+            i += 1
+            continue
+        j = i
+        while j < n and serialized_json[j] == "\\":
+            j += 1
+        if j < n and serialized_json[j] == "x":
+            slash_count = j - i
+            if slash_count % 2 == 1:
+                raise ValueError("Invalid \\x escape in serialized JSON")
+        i = j + 1
+
+
+def sanitize_geometry_string(value: str) -> str:
+    def replace_hex(match: re.Match) -> str:
+        decoded = chr(int(match.group(1), 16))
+        return decoded if 63 <= ord(decoded) <= 126 else "?"
+
+    # Decode canonical \xHH where it yields printable polyline characters.
+    sanitized = re.sub(r"\\x([0-9a-fA-F]{2})", replace_hex, value)
+    # Handle malformed \xH by dropping the marker and keeping the nibble as text.
+    sanitized = re.sub(r"\\x([0-9a-fA-F])(?![0-9a-fA-F])", lambda m: m.group(1), sanitized)
+    # Remove any remaining literal \x marker sequences.
+    sanitized = sanitized.replace("\\x", "x")
+    return sanitized
+
+
+def sanitize_route_geometries(route: Dict) -> None:
+    top_geom = route.get("geometry")
+    if isinstance(top_geom, str):
+        route["geometry"] = sanitize_geometry_string(top_geom)
+
+    steps = route.get("legs", [{}])[0].get("steps", [])
+    for step in steps:
+        geom = step.get("geometry")
+        if isinstance(geom, str):
+            step["geometry"] = sanitize_geometry_string(geom)
+
+
+def validate_route_schema(route: Dict) -> List[str]:
+    errors: List[str] = []
+    valid_maneuver_types = {"depart", "turn", "continue", "arrive", "roundabout"}
+    steps = route.get("legs", [{}])[0].get("steps", [])
+    for idx, step in enumerate(steps):
+        for field in ("distance", "duration", "mode"):
+            if field not in step:
+                errors.append(f"step {idx}: missing {field}")
+        maneuver = step.get("maneuver")
+        if not isinstance(maneuver, dict):
+            errors.append(f"step {idx}: missing maneuver")
+            continue
+        if "type" not in maneuver:
+            errors.append(f"step {idx}: maneuver missing type")
+        elif maneuver["type"] not in valid_maneuver_types:
+            errors.append(f"step {idx}: unsupported maneuver.type {maneuver['type']}")
+        location = maneuver.get("location")
+        if not (
+            isinstance(location, list)
+            and len(location) == 2
+            and all(isinstance(v, (int, float)) for v in location)
+        ):
+            errors.append(f"step {idx}: maneuver.location must be [lon, lat]")
+        intersections = step.get("intersections", [])
+        for inter_idx, inter in enumerate(intersections):
+            bearings = inter.get("bearings", [])
+            entry = inter.get("entry", [])
+            if len(entry) != len(bearings):
+                errors.append(f"step {idx} intersection {inter_idx}: len(entry) != len(bearings)")
+            if not all(isinstance(b, int) and 0 <= b <= 359 for b in bearings):
+                errors.append(f"step {idx} intersection {inter_idx}: bearings must be ints in [0..359]")
+            in_idx = inter.get("in")
+            out_idx = inter.get("out")
+            if in_idx is not None and (not isinstance(in_idx, int) or in_idx < 0 or in_idx >= len(bearings)):
+                errors.append(f"step {idx} intersection {inter_idx}: invalid in index")
+            if out_idx is not None and (not isinstance(out_idx, int) or out_idx < 0 or out_idx >= len(bearings)):
+                errors.append(f"step {idx} intersection {inter_idx}: invalid out index")
+    return errors
+
+
 def write_debug_artifacts(
     debug_dir: Path,
     matches: List[Match],
@@ -537,82 +752,130 @@ def build_route_json(
     speed_kmh: float,
     continue_threshold_deg: float,
     turn_threshold_deg: float,
+    merge_below_m: float,
 ) -> Dict:
     mode = mode_for_profile(profile)
 
     steps: List[Dict] = []
     maneuvers_debug: List[Dict] = []
-
-    for i, run in enumerate(runs):
-        coords = points[run.start_idx : run.end_idx + 1]
-        if len(coords) < 2:
-            if run.start_idx > 0:
-                coords = [points[run.start_idx - 1], points[run.start_idx]]
-            elif run.end_idx + 1 < len(points):
-                coords = [points[run.end_idx], points[run.end_idx + 1]]
-            else:
-                coords = [points[0], points[-1]]
-
-        distance_m = point_distance_sum(coords, 0, len(coords) - 1)
-        duration_s = distance_m / (speed_kmh * 1000.0 / 3600.0)
-
+    i = 0
+    while i < len(runs):
+        run = runs[i]
         if i == 0:
-            man_type = "depart"
-            modifier = None
-            bearing_before = None
             bearing_after = run_start_bearing(points, run)
-            location = [coords[0][1], coords[0][0]]
-            current_name = ""
-            next_name = run.name
-        else:
-            prev_run = runs[i - 1]
-            bearing_before = run_end_bearing(points, prev_run)
-            bearing_after = run_start_bearing(points, run)
-            delta = smallest_signed_angle(float(bearing_after - bearing_before))
-            if prev_run.tags.get("junction") == "roundabout" or run.tags.get("junction") == "roundabout":
-                man_type = "roundabout"
-                modifier = None
-            else:
+            location = [points[run.start_idx][1], points[run.start_idx][0]]
+            step = build_step(
+                points=points,
+                start_idx=run.start_idx,
+                end_idx=run.end_idx,
+                mode=mode,
+                speed_kmh=speed_kmh,
+                geometries=geometries,
+                man_type="depart",
+                modifier=None,
+                bearing_before=None,
+                bearing_after=bearing_after,
+                location=location,
+                instruction=format_instruction("depart", None, "", run.name, locale),
+                name=run.name,
+            )
+            steps.append(step)
+            i += 1
+            continue
+
+        prev_run = runs[i - 1]
+        is_rb = run.tags.get("junction") == "roundabout"
+        if is_rb:
+            rb_start = i
+            rb_end = i
+            while rb_end + 1 < len(runs) and runs[rb_end + 1].tags.get("junction") == "roundabout":
+                rb_end += 1
+            next_idx = rb_end + 1
+
+            entry_run = runs[rb_start]
+            entry_prev = runs[rb_start - 1]
+            entry_bearing_before = run_end_bearing(points, entry_prev)
+            entry_bearing_after = run_start_bearing(points, entry_run)
+            entry_location = [points[entry_run.start_idx][1], points[entry_run.start_idx][0]]
+            exit_count = None
+            exit_name = runs[next_idx].name if next_idx < len(runs) else ""
+            rb_instruction = format_instruction("roundabout", None, entry_prev.name, exit_name, locale, exit_count)
+            steps.append(
+                build_step(
+                    points=points,
+                    start_idx=entry_run.start_idx,
+                    end_idx=runs[rb_end].end_idx,
+                    mode=mode,
+                    speed_kmh=speed_kmh,
+                    geometries=geometries,
+                    man_type="roundabout",
+                    modifier=None,
+                    bearing_before=entry_bearing_before,
+                    bearing_after=entry_bearing_after,
+                    location=entry_location,
+                    instruction=rb_instruction,
+                    name=entry_run.name,
+                )
+            )
+
+            if next_idx < len(runs):
+                exit_run = runs[next_idx]
+                exit_bearing_before = run_end_bearing(points, runs[rb_end])
+                exit_bearing_after = run_start_bearing(points, exit_run)
+                delta = smallest_signed_angle(float(exit_bearing_after - exit_bearing_before))
                 man_type, modifier = classify_turn(delta, continue_threshold_deg, turn_threshold_deg)
-            location = [coords[0][1], coords[0][0]]
-            current_name = prev_run.name
-            next_name = run.name
+                exit_location = [points[exit_run.start_idx][1], points[exit_run.start_idx][0]]
+                steps.append(
+                    build_step(
+                        points=points,
+                        start_idx=exit_run.start_idx,
+                        end_idx=exit_run.end_idx,
+                        mode=mode,
+                        speed_kmh=speed_kmh,
+                        geometries=geometries,
+                        man_type=man_type,
+                        modifier=modifier,
+                        bearing_before=exit_bearing_before,
+                        bearing_after=exit_bearing_after,
+                        location=exit_location,
+                        instruction=format_instruction(man_type, modifier, runs[rb_end].name, exit_run.name, locale),
+                        name=exit_run.name,
+                    )
+                )
+                i = next_idx + 1
+            else:
+                i = next_idx
+            continue
 
-        instruction = format_instruction(man_type, modifier, current_name, next_name, locale)
+        bearing_before = run_end_bearing(points, prev_run)
+        bearing_after = run_start_bearing(points, run)
+        delta = smallest_signed_angle(float(bearing_after - bearing_before))
+        man_type, modifier = classify_turn(delta, continue_threshold_deg, turn_threshold_deg)
+        location = [points[run.start_idx][1], points[run.start_idx][0]]
+        steps.append(
+            build_step(
+                points=points,
+                start_idx=run.start_idx,
+                end_idx=run.end_idx,
+                mode=mode,
+                speed_kmh=speed_kmh,
+                geometries=geometries,
+                man_type=man_type,
+                modifier=modifier,
+                bearing_before=bearing_before,
+                bearing_after=bearing_after,
+                location=location,
+                instruction=format_instruction(man_type, modifier, prev_run.name, run.name, locale),
+                name=run.name,
+            )
+        )
+        i += 1
 
-        maneuver = {
-            "type": man_type,
-            "location": location,
-            "instruction": instruction,
-        }
-        if modifier is not None:
-            maneuver["modifier"] = modifier
-        if bearing_before is not None:
-            maneuver["bearing_before"] = int(bearing_before)
-        if bearing_after is not None:
-            maneuver["bearing_after"] = int(bearing_after)
+    steps = merge_continue_steps(steps, geometries=geometries, merge_below_m=merge_below_m)
 
-        step = {
-            "distance": distance_m,
-            "duration": duration_s,
-            "weight": duration_s,
-            "name": run.name,
-            "mode": mode,
-            "driving_side": "right",
-            "geometry": geometry_for(coords, geometries),
-            "maneuver": maneuver,
-            "intersections": [
-                {
-                    "location": location,
-                    "bearings": [int(bearing_after)] if bearing_after is not None else [],
-                    "entry": [True],
-                }
-            ],
-        }
-        steps.append(step)
-
-        debug_record = dict(maneuver)
-        debug_record["step_index"] = i
+    for idx, step in enumerate(steps):
+        debug_record = dict(step["maneuver"])
+        debug_record["step_index"] = idx
         maneuvers_debug.append(debug_record)
 
     last_point = points[-1]
@@ -628,9 +891,10 @@ def build_route_json(
         "name": "",
         "mode": mode,
         "driving_side": "right",
-        "geometry": geometry_for([last_point, last_point], geometries),
+        "geometry": "" if geometries != "geojson" else {"type": "LineString", "coordinates": []},
         "maneuver": arrive_maneuver,
-        "intersections": [{"location": [last_point[1], last_point[0]], "bearings": [], "entry": []}],
+        "intersections": [intersection_for("arrive", [last_point[1], last_point[0]], None, None)],
+        "_coords_latlon": [last_point],
     }
     steps.append(arrive_step)
     debug_arrive = dict(arrive_maneuver)
@@ -657,6 +921,8 @@ def build_route_json(
         ],
         "voiceLocale": locale,
     }
+    for step in steps:
+        step.pop("_coords_latlon", None)
     return route, maneuvers_debug
 
 
@@ -671,6 +937,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--speed-kmh must be > 0")
     if args.snap_radius_m <= 0:
         raise ValueError("--snap-radius-m must be > 0")
+    if args.merge_below_m < 0:
+        raise ValueError("--merge-below-m must be >= 0")
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
@@ -686,6 +954,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--turn-threshold-deg", type=float, default=30.0)
     parser.add_argument("--continue-threshold-deg", type=float, default=15.0)
     parser.add_argument("--min-run-dist-m", type=float, default=10.0)
+    parser.add_argument("--merge-below-m", type=float, default=40.0)
+    parser.add_argument("--strict-mapbox", action="store_true")
     parser.add_argument("--debug-dir", type=Path)
     parser.add_argument("--force", action="store_true", help="Allow output even if OSM match coverage < 80%")
 
@@ -726,10 +996,31 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             speed_kmh=args.speed_kmh,
             continue_threshold_deg=args.continue_threshold_deg,
             turn_threshold_deg=args.turn_threshold_deg,
+            merge_below_m=args.merge_below_m,
         )
+        sanitize_route_geometries(route_json)
+
+        for step_index, step in enumerate(route_json["legs"][0]["steps"]):
+            geom = step.get("geometry")
+            if isinstance(geom, str):
+                validate_polyline_string(geom, f"step {step_index} geometry")
+        top_geom = route_json.get("geometry")
+        if isinstance(top_geom, str):
+            validate_polyline_string(top_geom, "route geometry")
+
+        schema_errors = validate_route_schema(route_json)
+        if schema_errors:
+            if args.strict_mapbox:
+                raise ValueError("Mapbox schema validation failed: " + "; ".join(schema_errors))
+            print("Mapbox schema warnings: " + "; ".join(schema_errors), file=sys.stderr)
+
+        serialized = json.dumps(route_json, ensure_ascii=False)
+        json.loads(serialized)
+        validate_no_invalid_hex_escape(serialized)
 
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(route_json, ensure_ascii=True), encoding="utf-8")
+        with args.out.open("w", encoding="utf-8", newline="\n") as f:
+            f.write(serialized)
 
         if args.debug_dir is not None:
             write_debug_artifacts(args.debug_dir, matches, runs, maneuvers_debug, points)
