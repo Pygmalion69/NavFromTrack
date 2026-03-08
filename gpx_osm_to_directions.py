@@ -525,21 +525,23 @@ def build_step(
     distance_m = point_distance_sum(coords, 0, len(coords) - 1)
     duration_s = distance_m / (speed_kmh * 1000.0 / 3600.0)
 
+    resolved_bearing_before = int(round(bearing_before if bearing_before is not None else (bearing_after if bearing_after is not None else 0))) % 360
+    resolved_bearing_after = int(round(bearing_after if bearing_after is not None else (bearing_before if bearing_before is not None else 0))) % 360
+
     maneuver = {
         "type": man_type,
         "location": location,
         "instruction": instruction,
+        "bearing_before": resolved_bearing_before,
+        "bearing_after": resolved_bearing_after,
     }
     if modifier is not None:
         maneuver["modifier"] = modifier
-    if bearing_before is not None:
-        maneuver["bearing_before"] = int(bearing_before)
-    if bearing_after is not None:
-        maneuver["bearing_after"] = int(bearing_after)
 
     return {
         "distance": distance_m,
         "duration": duration_s,
+        "duration_typical": duration_s,
         "weight": duration_s,
         "name": name,
         "mode": mode,
@@ -648,6 +650,13 @@ def validate_route_schema(route: Dict) -> List[str]:
             errors.append(f"step {idx}: maneuver missing type")
         elif maneuver["type"] not in valid_maneuver_types:
             errors.append(f"step {idx}: unsupported maneuver.type {maneuver['type']}")
+        for bearing_field in ("bearing_before", "bearing_after"):
+            if bearing_field not in maneuver:
+                errors.append(f"step {idx}: maneuver missing {bearing_field}")
+                continue
+            bearing_value = maneuver[bearing_field]
+            if not isinstance(bearing_value, int) or not (0 <= bearing_value <= 359):
+                errors.append(f"step {idx}: maneuver {bearing_field} must be int in [0..359]")
         location = maneuver.get("location")
         if not (
             isinstance(location, list)
@@ -879,14 +888,22 @@ def build_route_json(
         maneuvers_debug.append(debug_record)
 
     last_point = points[-1]
+    if len(points) >= 2:
+        arrive_bearing_before = bearing_deg(points[-2][0], points[-2][1], last_point[0], last_point[1])
+    else:
+        arrive_bearing_before = 0
+
     arrive_maneuver = {
         "type": "arrive",
         "location": [last_point[1], last_point[0]],
         "instruction": format_instruction("arrive", None, "", "", locale),
+        "bearing_before": int(arrive_bearing_before),
+        "bearing_after": int(arrive_bearing_before),
     }
     arrive_step = {
         "distance": 0.0,
         "duration": 0.0,
+        "duration_typical": 0.0,
         "weight": 0.0,
         "name": "",
         "mode": mode,
@@ -907,6 +924,7 @@ def build_route_json(
     route = {
         "distance": leg_distance,
         "duration": leg_duration,
+        "duration_typical": leg_duration,
         "weight": leg_duration,
         "weight_name": "routability",
         "geometry": geometry_for(points, geometries),
@@ -915,10 +933,22 @@ def build_route_json(
                 "summary": "RPP route",
                 "distance": leg_distance,
                 "duration": leg_duration,
+                "duration_typical": leg_duration,
                 "weight": leg_duration,
                 "steps": steps,
             }
         ],
+        "routeOptions": {
+            "baseUrl": "https://api.mapbox.com",
+            "user": "mapbox",
+            "profile": mode,
+            "coordinates": [[lon, lat] for lat, lon in points],
+            "language": locale,
+            "geometries": geometries,
+            "steps": True,
+            "alternatives": False,
+            "overview": "full",
+        },
         "voiceLocale": locale,
     }
     for step in steps:
