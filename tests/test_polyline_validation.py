@@ -6,6 +6,7 @@ from gpx_osm_to_directions import (
     build_route_json,
     decode_polyline,
     encode_polyline,
+    validate_route_options_consistency,
     validate_route_polylines,
 )
 
@@ -73,6 +74,45 @@ class PolylineValidationTests(unittest.TestCase):
             merge_below_m=0.0,
         )
         validate_route_polylines(route, geometries="polyline6")
+
+    def test_route_options_and_step_instructions_present(self):
+        points = [
+            (51.7879486, 6.1436697),
+            (51.7879511, 6.1438125),
+            (51.7881000, 6.1440000),
+        ]
+        runs = [
+            Run(start_idx=0, end_idx=1, way_id=1, name="A", highway="residential", tags={"highway": "residential"}),
+            Run(start_idx=1, end_idx=2, way_id=2, name="B", highway="residential", tags={"highway": "residential"}),
+        ]
+        route, _ = build_route_json(
+            points=points,
+            runs=runs,
+            profile="car",
+            locale="en",
+            geometries="polyline6",
+            speed_kmh=30.0,
+            continue_threshold_deg=15.0,
+            turn_threshold_deg=30.0,
+            merge_below_m=0.0,
+        )
+
+        validate_route_options_consistency(route, profile="car", geometries="polyline6")
+        route_options = route["routeOptions"]
+        self.assertIs(route_options.get("voiceInstructions"), True)
+        self.assertIs(route_options.get("bannerInstructions"), True)
+        self.assertIs(route_options.get("roundaboutExits"), True)
+
+        for step in route["legs"][0]["steps"]:
+            maneuver_type = step.get("maneuver", {}).get("type")
+            if maneuver_type == "arrive":
+                self.assertIsInstance(step.get("voiceInstructions"), list)
+                self.assertIsInstance(step.get("bannerInstructions"), list)
+                continue
+            self.assertIsInstance(step.get("voiceInstructions"), list)
+            self.assertGreaterEqual(len(step["voiceInstructions"]), 1)
+            self.assertIsInstance(step.get("bannerInstructions"), list)
+            self.assertGreaterEqual(len(step["bannerInstructions"]), 1)
 
     def test_malformed_polyline_rejected(self):
         with self.assertRaises(ValueError):

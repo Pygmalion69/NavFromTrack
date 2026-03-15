@@ -52,3 +52,11 @@ Emits a single Mapbox route object with:
 - step/route geometry encoded per `--geometries`
 
 This is intended for Android ingestion via `DirectionsRoute.fromJson(...)`.
+
+The converter now validates generated polyline geometry before writing output.
+If any route or step polyline is invalid, it fails fast with a clear error instead
+of writing corrupted JSON.
+
+It also emits navigation-ready instruction metadata for Android import:
+`routeOptions.voiceInstructions=true`, `routeOptions.bannerInstructions=true`,
+`routeOptions.roundaboutExits=true`, and per-step `voiceInstructions` / `bannerInstructions`.

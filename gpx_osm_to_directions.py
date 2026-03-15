@@ -11,7 +11,6 @@ import argparse
 import csv
 import json
 import math
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -458,6 +457,60 @@ def format_instruction(
     return f"Turn {direction}"
 
 
+def escape_ssml_text(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def instruction_distance_along(step_distance_m: float) -> float:
+    if step_distance_m <= 0:
+        return 0.0
+    return float(min(80.0, max(5.0, step_distance_m * 0.5), step_distance_m))
+
+
+def build_voice_instructions(step_distance_m: float, instruction: str) -> List[Dict]:
+    if not instruction:
+        return []
+    distance_along = instruction_distance_along(step_distance_m)
+    return [
+        {
+            "distanceAlongGeometry": distance_along,
+            "announcement": instruction,
+            "ssmlAnnouncement": f"<speak>{escape_ssml_text(instruction)}</speak>",
+        }
+    ]
+
+
+def build_banner_instructions(
+    step_distance_m: float,
+    instruction: str,
+    step_name: str,
+    maneuver_type: str,
+    maneuver_modifier: Optional[str],
+) -> List[Dict]:
+    text = step_name or instruction or ""
+    if not text:
+        return []
+    primary = {
+        "text": text,
+        "type": maneuver_type,
+    }
+    if maneuver_modifier:
+        primary["modifier"] = maneuver_modifier
+    return [
+        {
+            "distanceAlongGeometry": instruction_distance_along(step_distance_m),
+            "primary": primary,
+            "sub": None,
+        }
+    ]
+
+
 def mode_for_profile(profile: str) -> str:
     return {"car": "driving", "bike": "cycling", "foot": "walking"}[profile]
 
@@ -538,6 +591,15 @@ def build_step(
     if modifier is not None:
         maneuver["modifier"] = modifier
 
+    voice_instructions = [] if man_type == "arrive" else build_voice_instructions(distance_m, instruction)
+    banner_instructions = [] if man_type == "arrive" else build_banner_instructions(
+        step_distance_m=distance_m,
+        instruction=instruction,
+        step_name=name,
+        maneuver_type=man_type,
+        maneuver_modifier=modifier,
+    )
+
     return {
         "distance": distance_m,
         "duration": duration_s,
@@ -549,6 +611,8 @@ def build_step(
         "geometry": geometry_for(coords, geometries),
         "maneuver": maneuver,
         "intersections": [intersection_for(man_type, location, bearing_before, bearing_after)],
+        "voiceInstructions": voice_instructions,
+        "bannerInstructions": banner_instructions,
         "_coords_latlon": coords,
     }
 
@@ -571,6 +635,7 @@ def merge_continue_steps(steps: List[Dict], geometries: str, merge_below_m: floa
             prev["distance"] = float(prev["distance"]) + float(step["distance"])
             prev["duration"] = float(prev["duration"]) + float(step["duration"])
             prev["weight"] = float(prev["weight"]) + float(step["weight"])
+            prev["duration_typical"] = float(prev.get("duration_typical", 0.0)) + float(step.get("duration_typical", 0.0))
 
             prev_coords = prev.get("_coords_latlon", [])
             cur_coords = step.get("_coords_latlon", [])
@@ -580,6 +645,18 @@ def merge_continue_steps(steps: List[Dict], geometries: str, merge_below_m: floa
                 merged_coords = prev_coords + cur_coords
             prev["_coords_latlon"] = merged_coords
             prev["geometry"] = geometry_for(merged_coords, geometries)
+            man = prev.get("maneuver", {})
+            instruction = str(man.get("instruction", ""))
+            man_type = str(man.get("type", "continue"))
+            man_modifier = man.get("modifier")
+            prev["voiceInstructions"] = [] if man_type == "arrive" else build_voice_instructions(float(prev["distance"]), instruction)
+            prev["bannerInstructions"] = [] if man_type == "arrive" else build_banner_instructions(
+                step_distance_m=float(prev["distance"]),
+                instruction=instruction,
+                step_name=str(prev.get("name", "")),
+                maneuver_type=man_type,
+                maneuver_modifier=str(man_modifier) if man_modifier is not None else None,
+            )
         else:
             merged.append(step)
     return merged
@@ -589,6 +666,130 @@ def validate_polyline_string(value: str, label: str) -> None:
     for ch in value:
         if ord(ch) < 32:
             raise ValueError(f"Invalid control character in {label}")
+
+
+def polyline_debug_snippet(encoded: str) -> str:
+    head = encoded[:80]
+    tail = encoded[-80:] if len(encoded) > 80 else encoded
+    return f"len={len(encoded)} head={head!r} tail={tail!r}"
+
+
+def decode_polyline(encoded: str, precision: int) -> List[Tuple[float, float]]:
+    if precision < 0:
+        raise ValueError("precision must be >= 0")
+
+    factor = 10 ** precision
+    index = 0
+    lat = 0
+    lon = 0
+    coords: List[Tuple[float, float]] = []
+
+    while index < len(encoded):
+        result = 0
+        shift = 0
+        while True:
+            if index >= len(encoded):
+                raise ValueError("truncated polyline while decoding latitude")
+            b = ord(encoded[index]) - 63
+            if b < 0 or b > 63:
+                raise ValueError(f"invalid character at index {index}")
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+            if shift > 60:
+                raise ValueError("latitude varint too long")
+        d_lat = ~(result >> 1) if (result & 1) else (result >> 1)
+        lat += d_lat
+
+        result = 0
+        shift = 0
+        while True:
+            if index >= len(encoded):
+                raise ValueError("truncated polyline while decoding longitude")
+            b = ord(encoded[index]) - 63
+            if b < 0 or b > 63:
+                raise ValueError(f"invalid character at index {index}")
+            index += 1
+            result |= (b & 0x1F) << shift
+            shift += 5
+            if b < 0x20:
+                break
+            if shift > 60:
+                raise ValueError("longitude varint too long")
+        d_lon = ~(result >> 1) if (result & 1) else (result >> 1)
+        lon += d_lon
+
+        coords.append((lat / factor, lon / factor))
+
+    return coords
+
+
+def assert_valid_polyline(encoded: str, precision: int, label: str) -> None:
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError(f"{label}: encoded geometry must be a non-empty string")
+    validate_polyline_string(encoded, label)
+    try:
+        coords = decode_polyline(encoded, precision)
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}; {polyline_debug_snippet(encoded)}") from exc
+    if len(coords) < 2:
+        raise ValueError(f"{label}: decoded polyline is too short; {polyline_debug_snippet(encoded)}")
+
+
+def polyline_precision_for(geometries: str) -> Optional[int]:
+    if geometries == "polyline6":
+        return 6
+    if geometries == "polyline":
+        return 5
+    return None
+
+
+def validate_route_polylines(route: Dict, geometries: str) -> None:
+    precision = polyline_precision_for(geometries)
+    if precision is None:
+        return
+
+    route_geometry = route.get("geometry")
+    if not isinstance(route_geometry, str):
+        raise ValueError("route geometry must be a polyline string")
+    assert_valid_polyline(route_geometry, precision, "route geometry")
+
+    legs = route.get("legs", [])
+    for leg_index, leg in enumerate(legs):
+        steps = leg.get("steps", [])
+        for step_index, step in enumerate(steps):
+            geom = step.get("geometry")
+            if not isinstance(geom, str):
+                raise ValueError(f"leg {leg_index} step {step_index} geometry must be a polyline string")
+            assert_valid_polyline(geom, precision, f"leg {leg_index} step {step_index} geometry")
+
+
+def validate_route_options_consistency(route: Dict, profile: str, geometries: str) -> None:
+    route_options = route.get("routeOptions")
+    if not isinstance(route_options, dict):
+        raise ValueError("routeOptions is missing or not an object")
+
+    if route_options.get("geometries") != geometries:
+        raise ValueError("routeOptions.geometries does not match actual geometry encoding")
+
+    if route_options.get("steps") is not True:
+        raise ValueError("routeOptions.steps must be true")
+    if route_options.get("voiceInstructions") is not True:
+        raise ValueError("routeOptions.voiceInstructions must be true")
+    if route_options.get("bannerInstructions") is not True:
+        raise ValueError("routeOptions.bannerInstructions must be true")
+    if route_options.get("roundaboutExits") is not True:
+        raise ValueError("routeOptions.roundaboutExits must be true")
+
+    coordinates = route_options.get("coordinates")
+    if not isinstance(coordinates, list) or len(coordinates) < 2:
+        raise ValueError("routeOptions.coordinates must be a list with at least 2 points")
+
+    expected_profile = mode_for_profile(profile)
+    if route_options.get("profile") != expected_profile:
+        raise ValueError(f"routeOptions.profile must be {expected_profile!r}")
 
 
 def validate_no_invalid_hex_escape(serialized_json: str) -> None:
@@ -608,35 +809,16 @@ def validate_no_invalid_hex_escape(serialized_json: str) -> None:
         i = j + 1
 
 
-def sanitize_geometry_string(value: str) -> str:
-    def replace_hex(match: re.Match) -> str:
-        decoded = chr(int(match.group(1), 16))
-        return decoded if 63 <= ord(decoded) <= 126 else "?"
-
-    # Decode canonical \xHH where it yields printable polyline characters.
-    sanitized = re.sub(r"\\x([0-9a-fA-F]{2})", replace_hex, value)
-    # Handle malformed \xH by dropping the marker and keeping the nibble as text.
-    sanitized = re.sub(r"\\x([0-9a-fA-F])(?![0-9a-fA-F])", lambda m: m.group(1), sanitized)
-    # Remove any remaining literal \x marker sequences.
-    sanitized = sanitized.replace("\\x", "x")
-    return sanitized
-
-
-def sanitize_route_geometries(route: Dict) -> None:
-    top_geom = route.get("geometry")
-    if isinstance(top_geom, str):
-        route["geometry"] = sanitize_geometry_string(top_geom)
-
-    steps = route.get("legs", [{}])[0].get("steps", [])
-    for step in steps:
-        geom = step.get("geometry")
-        if isinstance(geom, str):
-            step["geometry"] = sanitize_geometry_string(geom)
-
-
 def validate_route_schema(route: Dict) -> List[str]:
     errors: List[str] = []
     valid_maneuver_types = {"depart", "turn", "continue", "arrive", "roundabout"}
+    route_options = route.get("routeOptions", {})
+    if route_options.get("voiceInstructions") is not True:
+        errors.append("routeOptions.voiceInstructions must be true")
+    if route_options.get("bannerInstructions") is not True:
+        errors.append("routeOptions.bannerInstructions must be true")
+    if route_options.get("roundaboutExits") is not True:
+        errors.append("routeOptions.roundaboutExits must be true")
     steps = route.get("legs", [{}])[0].get("steps", [])
     for idx, step in enumerate(steps):
         for field in ("distance", "duration", "mode"):
@@ -650,6 +832,12 @@ def validate_route_schema(route: Dict) -> List[str]:
             errors.append(f"step {idx}: maneuver missing type")
         elif maneuver["type"] not in valid_maneuver_types:
             errors.append(f"step {idx}: unsupported maneuver.type {maneuver['type']}")
+        maneuver_type = maneuver.get("type")
+        if maneuver_type != "arrive":
+            if not isinstance(step.get("voiceInstructions"), list):
+                errors.append(f"step {idx}: missing voiceInstructions")
+            if not isinstance(step.get("bannerInstructions"), list):
+                errors.append(f"step {idx}: missing bannerInstructions")
         for bearing_field in ("bearing_before", "bearing_after"):
             if bearing_field not in maneuver:
                 errors.append(f"step {idx}: maneuver missing {bearing_field}")
@@ -908,10 +1096,12 @@ def build_route_json(
         "name": "",
         "mode": mode,
         "driving_side": "right",
-        "geometry": "" if geometries != "geojson" else {"type": "LineString", "coordinates": []},
+        "geometry": geometry_for(points[-2:] if len(points) >= 2 else [last_point, last_point], geometries),
         "maneuver": arrive_maneuver,
         "intersections": [intersection_for("arrive", [last_point[1], last_point[0]], None, None)],
-        "_coords_latlon": [last_point],
+        "voiceInstructions": [],
+        "bannerInstructions": [],
+        "_coords_latlon": points[-2:] if len(points) >= 2 else [last_point, last_point],
     }
     steps.append(arrive_step)
     debug_arrive = dict(arrive_maneuver)
@@ -946,6 +1136,9 @@ def build_route_json(
             "language": locale,
             "geometries": geometries,
             "steps": True,
+            "voiceInstructions": True,
+            "bannerInstructions": True,
+            "roundaboutExits": True,
             "alternatives": False,
             "overview": "full",
         },
@@ -1028,15 +1221,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             turn_threshold_deg=args.turn_threshold_deg,
             merge_below_m=args.merge_below_m,
         )
-        sanitize_route_geometries(route_json)
-
-        for step_index, step in enumerate(route_json["legs"][0]["steps"]):
-            geom = step.get("geometry")
-            if isinstance(geom, str):
-                validate_polyline_string(geom, f"step {step_index} geometry")
-        top_geom = route_json.get("geometry")
-        if isinstance(top_geom, str):
-            validate_polyline_string(top_geom, "route geometry")
+        validate_route_options_consistency(route_json, profile=args.profile, geometries=args.geometries)
+        validate_route_polylines(route_json, geometries=args.geometries)
 
         schema_errors = validate_route_schema(route_json)
         if schema_errors:
