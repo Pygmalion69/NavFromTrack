@@ -64,6 +64,30 @@ class Run:
     tags: Dict[str, str]
 
 
+@dataclass
+class ManeuverCandidate:
+    candidate_index: int
+    maneuver_idx: int
+    boundary_idx: int
+    exit_idx: int
+    road_from: str
+    road_to: str
+    highway_from: str
+    highway_to: str
+    approach_heading: int
+    departure_heading: int
+    signed_delta: float
+    maneuver_type: str
+    modifier: Optional[str]
+    instruction: str
+    step_name: str
+    emit: bool
+    reason: str
+    is_roundabout: bool
+    roundabout_exit: Optional[int]
+    step_index: Optional[int] = None
+
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -320,6 +344,65 @@ def point_distance_sum(points: List[Tuple[float, float]], start_idx: int, end_id
     return dist
 
 
+def cumulative_distances(points: List[Tuple[float, float]]) -> List[float]:
+    distances = [0.0]
+    for i in range(1, len(points)):
+        distances.append(distances[-1] + haversine_m(points[i - 1][0], points[i - 1][1], points[i][0], points[i][1]))
+    return distances
+
+
+def interpolate_point(points: List[Tuple[float, float]], cumulative: List[float], target_m: float) -> Tuple[float, float]:
+    if target_m <= 0.0:
+        return points[0]
+    if target_m >= cumulative[-1]:
+        return points[-1]
+
+    hi = 1
+    while hi < len(cumulative) and cumulative[hi] < target_m:
+        hi += 1
+    lo = max(0, hi - 1)
+    if hi >= len(points):
+        return points[-1]
+
+    start_d = cumulative[lo]
+    end_d = cumulative[hi]
+    if end_d <= start_d:
+        return points[hi]
+
+    ratio = (target_m - start_d) / (end_d - start_d)
+    lat = points[lo][0] + (points[hi][0] - points[lo][0]) * ratio
+    lon = points[lo][1] + (points[hi][1] - points[lo][1]) * ratio
+    return lat, lon
+
+
+def heading_around_index(
+    points: List[Tuple[float, float]],
+    cumulative: List[float],
+    center_idx: int,
+    window_m: float,
+    forward: bool,
+) -> int:
+    center_d = cumulative[center_idx]
+    center_point = points[center_idx]
+    if forward:
+        target_point = interpolate_point(points, cumulative, min(cumulative[-1], center_d + window_m))
+        return bearing_deg(center_point[0], center_point[1], target_point[0], target_point[1])
+    target_point = interpolate_point(points, cumulative, max(0.0, center_d - window_m))
+    return bearing_deg(target_point[0], target_point[1], center_point[0], center_point[1])
+
+
+def normalized_road_name(name: str) -> str:
+    return " ".join(name.strip().lower().split())
+
+
+def same_road_identity(prev_run: Run, next_run: Run) -> bool:
+    if prev_run.way_id is not None and prev_run.way_id == next_run.way_id:
+        return True
+    prev_name = normalized_road_name(prev_run.name)
+    next_name = normalized_road_name(next_run.name)
+    return bool(prev_name and prev_name == next_name)
+
+
 def build_runs(matches: List[Match]) -> List[Run]:
     if not matches:
         return []
@@ -423,6 +506,14 @@ def classify_turn(delta: float, continue_threshold_deg: float, turn_threshold_de
     return "turn", "sharp left"
 
 
+def ordinal(value: int) -> str:
+    if 10 <= (value % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+    return f"{value}{suffix}"
+
+
 def format_instruction(
     maneuver_type: str,
     modifier: Optional[str],
@@ -440,10 +531,10 @@ def format_instruction(
         return "Arrive at destination"
     if maneuver_type == "roundabout":
         if roundabout_exit is not None and next_name:
-            return f"At roundabout, take exit {roundabout_exit} onto {next_name}"
+            return f"At the roundabout, take the {ordinal(roundabout_exit)} exit onto {next_name}"
         if roundabout_exit is not None:
-            return f"At roundabout, take exit {roundabout_exit}"
-        return "Enter the roundabout and continue"
+            return f"At the roundabout, take the {ordinal(roundabout_exit)} exit"
+        return "Enter the roundabout"
     if maneuver_type == "continue":
         if next_name:
             return f"Continue on {next_name}"
@@ -573,6 +664,7 @@ def build_step(
     location: List[float],
     instruction: str,
     name: str,
+    roundabout_exit: Optional[int] = None,
 ) -> Dict:
     coords = coords_for_range(points, start_idx, end_idx)
     distance_m = point_distance_sum(coords, 0, len(coords) - 1)
@@ -590,6 +682,8 @@ def build_step(
     }
     if modifier is not None:
         maneuver["modifier"] = modifier
+    if roundabout_exit is not None:
+        maneuver["exit"] = int(roundabout_exit)
 
     voice_instructions = [] if man_type == "arrive" else build_voice_instructions(distance_m, instruction)
     banner_instructions = [] if man_type == "arrive" else build_banner_instructions(
@@ -660,6 +754,139 @@ def merge_continue_steps(steps: List[Dict], geometries: str, merge_below_m: floa
         else:
             merged.append(step)
     return merged
+
+
+def estimate_roundabout_exit_count(runs: List[Run], rb_start: int, rb_end: int) -> int:
+    exit_count = 1
+    seen_keys = set()
+    for idx in range(rb_start, rb_end + 1):
+        key = (
+            runs[idx].way_id,
+            normalized_road_name(runs[idx].name),
+            runs[idx].start_idx,
+            runs[idx].end_idx,
+        )
+        if key not in seen_keys:
+            seen_keys.add(key)
+            exit_count += 1
+    return max(1, exit_count - 1)
+
+
+def build_maneuver_candidates(
+    points: List[Tuple[float, float]],
+    runs: List[Run],
+    locale: str,
+    continue_threshold_deg: float,
+    turn_threshold_deg: float,
+    heading_window_m: float = 20.0,
+) -> List[ManeuverCandidate]:
+    cumulative = cumulative_distances(points)
+    candidates: List[ManeuverCandidate] = []
+    i = 1
+
+    while i < len(runs):
+        prev_run = runs[i - 1]
+        run = runs[i]
+
+        if run.tags.get("junction") == "roundabout":
+            rb_start = i
+            rb_end = i
+            while rb_end + 1 < len(runs) and runs[rb_end + 1].tags.get("junction") == "roundabout":
+                rb_end += 1
+            next_idx = rb_end + 1
+            road_to = runs[next_idx].name if next_idx < len(runs) else ""
+            exit_idx = runs[next_idx].start_idx if next_idx < len(runs) else runs[rb_end].end_idx
+            approach_heading = heading_around_index(points, cumulative, runs[rb_start].start_idx, heading_window_m, forward=False)
+            departure_heading = heading_around_index(points, cumulative, exit_idx, heading_window_m, forward=True)
+            signed_delta = smallest_signed_angle(float(departure_heading - approach_heading))
+            exit_count = estimate_roundabout_exit_count(runs, rb_start, rb_end)
+            candidates.append(
+                ManeuverCandidate(
+                    candidate_index=len(candidates),
+                    maneuver_idx=runs[rb_start].start_idx,
+                    boundary_idx=runs[rb_start].start_idx,
+                    exit_idx=exit_idx,
+                    road_from=prev_run.name,
+                    road_to=road_to,
+                    highway_from=prev_run.highway,
+                    highway_to=runs[next_idx].highway if next_idx < len(runs) else "",
+                    approach_heading=approach_heading,
+                    departure_heading=departure_heading,
+                    signed_delta=signed_delta,
+                    maneuver_type="roundabout",
+                    modifier=None,
+                    instruction=format_instruction("roundabout", None, prev_run.name, road_to, locale, exit_count),
+                    step_name=road_to,
+                    emit=True,
+                    reason="emit: composite roundabout maneuver",
+                    is_roundabout=True,
+                    roundabout_exit=exit_count,
+                )
+            )
+            i = next_idx
+            continue
+
+        maneuver_idx = run.start_idx
+        approach_heading = heading_around_index(points, cumulative, maneuver_idx, heading_window_m, forward=False)
+        departure_heading = heading_around_index(points, cumulative, maneuver_idx, heading_window_m, forward=True)
+        signed_delta = smallest_signed_angle(float(departure_heading - approach_heading))
+        abs_delta = abs(signed_delta)
+        same_road = same_road_identity(prev_run, run)
+        highway_changed = bool(prev_run.highway and run.highway and prev_run.highway != run.highway)
+        road_to = run.name
+        emit = False
+        reason = "suppress: unchanged geometry"
+        maneuver_type = "continue"
+        modifier: Optional[str] = "straight"
+
+        if abs_delta >= turn_threshold_deg:
+            maneuver_type, modifier = classify_turn(signed_delta, continue_threshold_deg, turn_threshold_deg)
+            if same_road and not highway_changed:
+                emit = False
+                reason = "suppress: same-road bend"
+            else:
+                emit = True
+                reason = "emit: significant heading change"
+        elif abs_delta <= continue_threshold_deg:
+            emit = False
+            reason = "suppress: below continue threshold"
+        elif same_road and not highway_changed:
+            emit = False
+            reason = "suppress: same-road non-decision"
+        elif not road_to and not highway_changed:
+            emit = False
+            reason = "suppress: unnamed minor bend"
+        else:
+            emit = True
+            reason = "emit: minor heading change with meaningful road change"
+
+        instruction = format_instruction(maneuver_type, modifier, prev_run.name, road_to, locale)
+        candidates.append(
+            ManeuverCandidate(
+                candidate_index=len(candidates),
+                maneuver_idx=maneuver_idx,
+                boundary_idx=maneuver_idx,
+                exit_idx=maneuver_idx,
+                road_from=prev_run.name,
+                road_to=road_to,
+                highway_from=prev_run.highway,
+                highway_to=run.highway,
+                approach_heading=approach_heading,
+                departure_heading=departure_heading,
+                signed_delta=signed_delta,
+                maneuver_type=maneuver_type,
+                modifier=modifier,
+                instruction=instruction,
+                step_name=road_to,
+                emit=emit,
+                reason=reason,
+                is_roundabout=False,
+                roundabout_exit=None,
+            )
+        )
+        i += 1
+
+    return candidates
 
 
 def validate_polyline_string(value: str, label: str) -> None:
@@ -873,7 +1100,7 @@ def write_debug_artifacts(
     debug_dir: Path,
     matches: List[Match],
     runs: List[Run],
-    maneuvers: List[Dict],
+    candidates: List[ManeuverCandidate],
     points: List[Tuple[float, float]],
 ) -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -892,18 +1119,41 @@ def write_debug_artifacts(
 
     with (debug_dir / "maneuvers.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["step_index", "lat", "lon", "type", "modifier", "instruction", "bearing_before", "bearing_after"])
-        for m in maneuvers:
+        writer.writerow(
+            [
+                "candidate_index",
+                "step_index",
+                "lat",
+                "lon",
+                "type",
+                "modifier",
+                "instruction",
+                "heading_before",
+                "heading_after",
+                "delta",
+                "road_from",
+                "road_to",
+                "emit",
+                "reason",
+            ]
+        )
+        for m in candidates:
             writer.writerow(
                 [
-                    m.get("step_index"),
-                    m["location"][1],
-                    m["location"][0],
-                    m["type"],
-                    m.get("modifier", ""),
-                    m.get("instruction", ""),
-                    m.get("bearing_before", ""),
-                    m.get("bearing_after", ""),
+                    m.candidate_index,
+                    m.step_index if m.step_index is not None else "",
+                    points[m.maneuver_idx][0],
+                    points[m.maneuver_idx][1],
+                    m.maneuver_type,
+                    m.modifier or "",
+                    m.instruction,
+                    m.approach_heading,
+                    m.departure_heading,
+                    round(m.signed_delta, 3),
+                    m.road_from,
+                    m.road_to,
+                    str(m.emit).lower(),
+                    m.reason,
                 ]
             )
 
@@ -928,13 +1178,17 @@ def write_debug_artifacts(
             {
                 "type": "Feature",
                 "properties": {
-                    "type": m["type"],
-                    "modifier": m.get("modifier"),
-                    "instruction": m.get("instruction", ""),
+                    "type": m.maneuver_type,
+                    "modifier": m.modifier,
+                    "instruction": m.instruction,
+                    "road_from": m.road_from,
+                    "road_to": m.road_to,
+                    "emit": m.emit,
+                    "reason": m.reason,
                 },
-                "geometry": {"type": "Point", "coordinates": m["location"]},
+                "geometry": {"type": "Point", "coordinates": [points[m.maneuver_idx][1], points[m.maneuver_idx][0]]},
             }
-            for m in maneuvers
+            for m in candidates
         ],
     }
     (debug_dir / "maneuvers.geojson").write_text(json.dumps(maneuvers_geojson, indent=2), encoding="utf-8")
@@ -950,130 +1204,67 @@ def build_route_json(
     continue_threshold_deg: float,
     turn_threshold_deg: float,
     merge_below_m: float,
-) -> Dict:
+) -> Tuple[Dict, List[ManeuverCandidate]]:
     mode = mode_for_profile(profile)
+    candidates = build_maneuver_candidates(
+        points=points,
+        runs=runs,
+        locale=locale,
+        continue_threshold_deg=continue_threshold_deg,
+        turn_threshold_deg=turn_threshold_deg,
+    )
+    emitted_candidates = [candidate for candidate in candidates if candidate.emit]
+
+    cumulative = cumulative_distances(points)
+    depart_bearing_after = heading_around_index(points, cumulative, 0, 20.0, forward=True)
+    events: List[Tuple[str, Optional[ManeuverCandidate], int]] = [("depart", None, 0)]
+    events.extend(("candidate", candidate, candidate.maneuver_idx) for candidate in emitted_candidates)
 
     steps: List[Dict] = []
-    maneuvers_debug: List[Dict] = []
-    i = 0
-    while i < len(runs):
-        run = runs[i]
-        if i == 0:
-            bearing_after = run_start_bearing(points, run)
-            location = [points[run.start_idx][1], points[run.start_idx][0]]
+    for idx, (event_type, candidate, start_idx) in enumerate(events):
+        next_start_idx = events[idx + 1][2] if idx + 1 < len(events) else len(points) - 1
+        end_idx = max(start_idx, next_start_idx)
+
+        if event_type == "depart":
+            name = runs[0].name
+            instruction = format_instruction("depart", None, "", name, locale)
             step = build_step(
                 points=points,
-                start_idx=run.start_idx,
-                end_idx=run.end_idx,
+                start_idx=start_idx,
+                end_idx=end_idx,
                 mode=mode,
                 speed_kmh=speed_kmh,
                 geometries=geometries,
                 man_type="depart",
                 modifier=None,
                 bearing_before=None,
-                bearing_after=bearing_after,
-                location=location,
-                instruction=format_instruction("depart", None, "", run.name, locale),
-                name=run.name,
+                bearing_after=depart_bearing_after,
+                location=[points[0][1], points[0][0]],
+                instruction=instruction,
+                name=name,
             )
-            steps.append(step)
-            i += 1
-            continue
-
-        prev_run = runs[i - 1]
-        is_rb = run.tags.get("junction") == "roundabout"
-        if is_rb:
-            rb_start = i
-            rb_end = i
-            while rb_end + 1 < len(runs) and runs[rb_end + 1].tags.get("junction") == "roundabout":
-                rb_end += 1
-            next_idx = rb_end + 1
-
-            entry_run = runs[rb_start]
-            entry_prev = runs[rb_start - 1]
-            entry_bearing_before = run_end_bearing(points, entry_prev)
-            entry_bearing_after = run_start_bearing(points, entry_run)
-            entry_location = [points[entry_run.start_idx][1], points[entry_run.start_idx][0]]
-            exit_count = None
-            exit_name = runs[next_idx].name if next_idx < len(runs) else ""
-            rb_instruction = format_instruction("roundabout", None, entry_prev.name, exit_name, locale, exit_count)
-            steps.append(
-                build_step(
-                    points=points,
-                    start_idx=entry_run.start_idx,
-                    end_idx=runs[rb_end].end_idx,
-                    mode=mode,
-                    speed_kmh=speed_kmh,
-                    geometries=geometries,
-                    man_type="roundabout",
-                    modifier=None,
-                    bearing_before=entry_bearing_before,
-                    bearing_after=entry_bearing_after,
-                    location=entry_location,
-                    instruction=rb_instruction,
-                    name=entry_run.name,
-                )
-            )
-
-            if next_idx < len(runs):
-                exit_run = runs[next_idx]
-                exit_bearing_before = run_end_bearing(points, runs[rb_end])
-                exit_bearing_after = run_start_bearing(points, exit_run)
-                delta = smallest_signed_angle(float(exit_bearing_after - exit_bearing_before))
-                man_type, modifier = classify_turn(delta, continue_threshold_deg, turn_threshold_deg)
-                exit_location = [points[exit_run.start_idx][1], points[exit_run.start_idx][0]]
-                steps.append(
-                    build_step(
-                        points=points,
-                        start_idx=exit_run.start_idx,
-                        end_idx=exit_run.end_idx,
-                        mode=mode,
-                        speed_kmh=speed_kmh,
-                        geometries=geometries,
-                        man_type=man_type,
-                        modifier=modifier,
-                        bearing_before=exit_bearing_before,
-                        bearing_after=exit_bearing_after,
-                        location=exit_location,
-                        instruction=format_instruction(man_type, modifier, runs[rb_end].name, exit_run.name, locale),
-                        name=exit_run.name,
-                    )
-                )
-                i = next_idx + 1
-            else:
-                i = next_idx
-            continue
-
-        bearing_before = run_end_bearing(points, prev_run)
-        bearing_after = run_start_bearing(points, run)
-        delta = smallest_signed_angle(float(bearing_after - bearing_before))
-        man_type, modifier = classify_turn(delta, continue_threshold_deg, turn_threshold_deg)
-        location = [points[run.start_idx][1], points[run.start_idx][0]]
-        steps.append(
-            build_step(
+        else:
+            assert candidate is not None
+            candidate.step_index = len(steps)
+            step = build_step(
                 points=points,
-                start_idx=run.start_idx,
-                end_idx=run.end_idx,
+                start_idx=start_idx,
+                end_idx=end_idx,
                 mode=mode,
                 speed_kmh=speed_kmh,
                 geometries=geometries,
-                man_type=man_type,
-                modifier=modifier,
-                bearing_before=bearing_before,
-                bearing_after=bearing_after,
-                location=location,
-                instruction=format_instruction(man_type, modifier, prev_run.name, run.name, locale),
-                name=run.name,
+                man_type=candidate.maneuver_type,
+                modifier=candidate.modifier,
+                bearing_before=candidate.approach_heading,
+                bearing_after=candidate.departure_heading,
+                location=[points[start_idx][1], points[start_idx][0]],
+                instruction=candidate.instruction,
+                name=candidate.step_name,
+                roundabout_exit=candidate.roundabout_exit,
             )
-        )
-        i += 1
+        steps.append(step)
 
     steps = merge_continue_steps(steps, geometries=geometries, merge_below_m=merge_below_m)
-
-    for idx, step in enumerate(steps):
-        debug_record = dict(step["maneuver"])
-        debug_record["step_index"] = idx
-        maneuvers_debug.append(debug_record)
 
     last_point = points[-1]
     if len(points) >= 2:
@@ -1104,9 +1295,6 @@ def build_route_json(
         "_coords_latlon": points[-2:] if len(points) >= 2 else [last_point, last_point],
     }
     steps.append(arrive_step)
-    debug_arrive = dict(arrive_maneuver)
-    debug_arrive["step_index"] = len(steps) - 1
-    maneuvers_debug.append(debug_arrive)
 
     leg_distance = sum(step["distance"] for step in steps)
     leg_duration = sum(step["duration"] for step in steps)
@@ -1146,7 +1334,7 @@ def build_route_json(
     }
     for step in steps:
         step.pop("_coords_latlon", None)
-    return route, maneuvers_debug
+    return route, candidates
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -1210,7 +1398,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if not runs:
             raise ValueError("No runs could be produced from matched points")
 
-        route_json, maneuvers_debug = build_route_json(
+        route_json, candidate_debug = build_route_json(
             points=points,
             runs=runs,
             profile=args.profile,
@@ -1239,7 +1427,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             f.write(serialized)
 
         if args.debug_dir is not None:
-            write_debug_artifacts(args.debug_dir, matches, runs, maneuvers_debug, points)
+            write_debug_artifacts(args.debug_dir, matches, runs, candidate_debug, points)
 
         return 0
 
