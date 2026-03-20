@@ -6,6 +6,8 @@ from gpx_osm_to_directions import (
     build_route_json,
     decode_polyline,
     encode_polyline,
+    intersection_for,
+    smooth_runs,
     validate_route_options_consistency,
     validate_route_polylines,
 )
@@ -194,7 +196,89 @@ class PolylineValidationTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertFalse(candidates[0].emit)
         self.assertIn("same-road", candidates[0].reason)
+        self.assertFalse(any(candidate.modifier == "uturn" for candidate in candidates))
         self.assertEqual([step["maneuver"]["type"] for step in route["legs"][0]["steps"]], ["depart", "arrive"])
+
+    def test_dead_end_route_emits_entry_uturn_and_exit(self):
+        points = [
+            (0.0, 0.0),
+            (0.0, 0.0002),
+            (0.0, 0.0004),
+            (0.0001, 0.0004),
+            (0.0002, 0.0004),
+            (0.0001, 0.0004),
+            (0.0, 0.0004),
+            (0.0, 0.0002),
+            (0.0, 0.0),
+        ]
+        runs = [
+            Run(start_idx=0, end_idx=2, way_id=1, name="Main St", highway="residential", tags={"highway": "residential"}),
+            Run(start_idx=2, end_idx=6, way_id=2, name="Dead End Ln", highway="residential", tags={"highway": "residential"}),
+            Run(start_idx=6, end_idx=8, way_id=1, name="Main St", highway="residential", tags={"highway": "residential"}),
+        ]
+
+        route, candidates = self.build_route(points, runs)
+
+        turns = route["legs"][0]["steps"][1:-1]
+        self.assertEqual([step["maneuver"]["type"] for step in turns], ["turn", "turn", "turn"])
+        self.assertEqual([step["maneuver"].get("modifier") for step in turns], ["left", "uturn", "right"])
+        self.assertEqual(turns[1]["maneuver"]["instruction"], "Make a U-turn")
+
+        dead_end_candidates = [candidate for candidate in candidates if candidate.source_kind.startswith("dead_end")]
+        self.assertEqual(len(dead_end_candidates), 3)
+        self.assertTrue(all(candidate.emit for candidate in dead_end_candidates))
+        self.assertTrue(all(candidate.reversal_detected for candidate in dead_end_candidates))
+        self.assertTrue(any(candidate.modifier == "uturn" and candidate.forced_emit for candidate in candidates))
+
+    def test_short_dead_end_survives_smoothing_and_emits_uturn(self):
+        points = [
+            (0.0, 0.0),
+            (0.0, 0.0002),
+            (0.0, 0.0004),
+            (0.00003, 0.0004),
+            (0.00006, 0.0004),
+            (0.00003, 0.0004),
+            (0.0, 0.0004),
+            (0.0, 0.0002),
+            (0.0, 0.0),
+        ]
+        runs = [
+            Run(start_idx=0, end_idx=2, way_id=1, name="Main St", highway="residential", tags={"highway": "residential"}),
+            Run(start_idx=2, end_idx=6, way_id=2, name="Stub Ln", highway="residential", tags={"highway": "residential"}),
+            Run(start_idx=6, end_idx=8, way_id=1, name="Main St", highway="residential", tags={"highway": "residential"}),
+        ]
+
+        smoothed = smooth_runs(runs, points, min_run_dist_m=20.0)
+        self.assertEqual(len(smoothed), 3)
+
+        route, candidates = self.build_route(points, smoothed)
+
+        self.assertIn("uturn", [step["maneuver"].get("modifier") for step in route["legs"][0]["steps"]])
+        self.assertTrue(any(candidate.source_kind == "dead_end_reversal" and candidate.emit for candidate in candidates))
+
+    def test_true_uturn_on_same_road_is_detected(self):
+        points = [
+            (0.0, 0.0),
+            (0.0, 0.0002),
+            (0.0, 0.0004),
+            (0.0, 0.0006),
+            (0.0, 0.0004),
+            (0.0, 0.0002),
+            (0.0, 0.0),
+        ]
+        runs = [
+            Run(start_idx=0, end_idx=6, way_id=1, name="Main St", highway="residential", tags={"highway": "residential"}),
+        ]
+
+        route, candidates = self.build_route(points, runs)
+
+        self.assertEqual([step["maneuver"]["type"] for step in route["legs"][0]["steps"]], ["depart", "turn", "arrive"])
+        self.assertEqual(route["legs"][0]["steps"][1]["maneuver"]["modifier"], "uturn")
+        self.assertTrue(any(candidate.source_kind == "reversal" and candidate.emit for candidate in candidates))
+
+    def test_intersection_bearings_are_normalized_to_359(self):
+        inter = intersection_for("turn", [0.0, 0.0], 180, 360)
+        self.assertEqual(inter["bearings"], [180, 0])
 
 
 if __name__ == "__main__":

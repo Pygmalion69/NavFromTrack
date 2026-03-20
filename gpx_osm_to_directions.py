@@ -85,6 +85,10 @@ class ManeuverCandidate:
     reason: str
     is_roundabout: bool
     roundabout_exit: Optional[int]
+    source_kind: str = "boundary"
+    forced_emit: bool = False
+    reversal_detected: bool = False
+    suppressed_reason: Optional[str] = None
     step_index: Optional[int] = None
 
 
@@ -344,6 +348,10 @@ def point_distance_sum(points: List[Tuple[float, float]], start_idx: int, end_id
     return dist
 
 
+def run_distance_m(points: List[Tuple[float, float]], run: Run) -> float:
+    return point_distance_sum(points, run.start_idx, run.end_idx)
+
+
 def cumulative_distances(points: List[Tuple[float, float]]) -> List[float]:
     distances = [0.0]
     for i in range(1, len(points)):
@@ -446,13 +454,13 @@ def smooth_runs(runs: List[Run], points: List[Tuple[float, float]], min_run_dist
             prev_run = smoothed[i - 1]
             cur_run = smoothed[i]
             next_run = smoothed[i + 1]
-            cur_dist = point_distance_sum(points, cur_run.start_idx, cur_run.end_idx)
+            cur_dist = run_distance_m(points, cur_run)
             same_neighbors = (
                 prev_run.way_id is not None
                 and prev_run.way_id == next_run.way_id
                 and prev_run.name == next_run.name
             )
-            if cur_dist < min_run_dist_m and same_neighbors:
+            if cur_dist < min_run_dist_m and same_neighbors and not run_has_reversal(points, cur_run):
                 merged = Run(
                     start_idx=prev_run.start_idx,
                     end_idx=next_run.end_idx,
@@ -506,6 +514,77 @@ def classify_turn(delta: float, continue_threshold_deg: float, turn_threshold_de
     return "turn", "sharp left"
 
 
+def heading_window_for_interval(interval_m: float, heading_window_m: float) -> float:
+    if interval_m <= 0.0:
+        return 0.0
+    return min(heading_window_m, interval_m / 2.0)
+
+
+def reversal_metrics_for_index(
+    points: List[Tuple[float, float]],
+    cumulative: List[float],
+    run: Run,
+    center_idx: int,
+    heading_window_m: float,
+) -> Optional[Tuple[int, int, float]]:
+    if center_idx <= run.start_idx or center_idx >= run.end_idx:
+        return None
+
+    dist_before = cumulative[center_idx] - cumulative[run.start_idx]
+    dist_after = cumulative[run.end_idx] - cumulative[center_idx]
+    back_window = heading_window_for_interval(dist_before, heading_window_m)
+    forward_window = heading_window_for_interval(dist_after, heading_window_m)
+    if back_window <= 0.0 or forward_window <= 0.0:
+        return None
+
+    approach_heading = heading_around_index(points, cumulative, center_idx, back_window, forward=False)
+    departure_heading = heading_around_index(points, cumulative, center_idx, forward_window, forward=True)
+    signed_delta = smallest_signed_angle(float(departure_heading - approach_heading))
+    return approach_heading, departure_heading, signed_delta
+
+
+def path_retraces_around_index(
+    points: List[Tuple[float, float]],
+    center_idx: int,
+    retrace_tolerance_m: float = 12.0,
+) -> bool:
+    if center_idx <= 0 or center_idx + 1 >= len(points):
+        return False
+    prev_point = points[center_idx - 1]
+    next_point = points[center_idx + 1]
+    return haversine_m(prev_point[0], prev_point[1], next_point[0], next_point[1]) <= retrace_tolerance_m
+
+
+def find_run_reversal(
+    points: List[Tuple[float, float]],
+    run: Run,
+    heading_window_m: float = 20.0,
+    reversal_threshold_deg: float = 150.0,
+    retrace_tolerance_m: float = 12.0,
+) -> Optional[Tuple[int, int, int, float]]:
+    if run.end_idx - run.start_idx < 2:
+        return None
+
+    cumulative = cumulative_distances(points)
+    best: Optional[Tuple[int, int, int, float]] = None
+    for center_idx in range(run.start_idx + 1, run.end_idx):
+        metrics = reversal_metrics_for_index(points, cumulative, run, center_idx, heading_window_m)
+        if metrics is None:
+            continue
+        approach_heading, departure_heading, signed_delta = metrics
+        if abs(signed_delta) < reversal_threshold_deg:
+            continue
+        if not path_retraces_around_index(points, center_idx, retrace_tolerance_m=retrace_tolerance_m):
+            continue
+        if best is None or abs(signed_delta) > abs(best[3]):
+            best = (center_idx, approach_heading, departure_heading, signed_delta)
+    return best
+
+
+def run_has_reversal(points: List[Tuple[float, float]], run: Run, heading_window_m: float = 20.0) -> bool:
+    return find_run_reversal(points, run, heading_window_m=heading_window_m) is not None
+
+
 def ordinal(value: int) -> str:
     if 10 <= (value % 100) <= 20:
         suffix = "th"
@@ -539,6 +618,8 @@ def format_instruction(
         if next_name:
             return f"Continue on {next_name}"
         return "Continue"
+    if modifier == "uturn":
+        return "Make a U-turn"
 
     direction = modifier or "straight"
     if next_name and next_name != current_name:
@@ -627,8 +708,14 @@ def intersection_for(
     bearing_before: Optional[int],
     bearing_after: Optional[int],
 ) -> Dict:
+    def normalize_bearing(value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        return int(round(value)) % 360
+
     if man_type == "depart":
-        bearings = [int(bearing_after)] if bearing_after is not None else []
+        normalized_after = normalize_bearing(bearing_after)
+        bearings = [normalized_after] if normalized_after is not None else []
         inter = {"location": location, "bearings": bearings, "entry": [True] * len(bearings)}
         if bearings:
             inter["out"] = 0
@@ -637,10 +724,12 @@ def intersection_for(
         return {"location": location, "bearings": [], "entry": []}
 
     bearings: List[int] = []
-    if bearing_before is not None:
-        bearings.append(int(bearing_before))
-    if bearing_after is not None:
-        bearings.append(int(bearing_after))
+    normalized_before = normalize_bearing(bearing_before)
+    normalized_after = normalize_bearing(bearing_after)
+    if normalized_before is not None:
+        bearings.append(normalized_before)
+    if normalized_after is not None:
+        bearings.append(normalized_after)
     inter = {"location": location, "bearings": bearings, "entry": [True] * len(bearings)}
     if len(bearings) >= 2:
         inter["in"] = 0
@@ -821,6 +910,7 @@ def build_maneuver_candidates(
                     reason="emit: composite roundabout maneuver",
                     is_roundabout=True,
                     roundabout_exit=exit_count,
+                    source_kind="roundabout",
                 )
             )
             i = next_idx
@@ -907,11 +997,85 @@ def build_maneuver_candidates(
                 reason=reason,
                 is_roundabout=False,
                 roundabout_exit=None,
+                source_kind="boundary",
+                suppressed_reason=None if emit else reason,
             )
         )
         i += 1
 
     return candidates
+
+
+def detect_dead_end_reversals(
+    candidates: List[ManeuverCandidate],
+    runs: List[Run],
+    points: List[Tuple[float, float]],
+    locale: str,
+    heading_window_m: float = 20.0,
+    reversal_threshold_deg: float = 150.0,
+) -> List[ManeuverCandidate]:
+    boundary_map = {candidate.boundary_idx: candidate for candidate in candidates}
+    updated = list(candidates)
+
+    for run_idx, run in enumerate(runs):
+        prev_run = runs[run_idx - 1] if run_idx > 0 else None
+        next_run = runs[run_idx + 1] if run_idx + 1 < len(runs) else None
+        dead_end_context = bool(prev_run and next_run and same_road_identity(prev_run, next_run))
+
+        reversal = find_run_reversal(
+            points,
+            run,
+            heading_window_m=heading_window_m,
+            reversal_threshold_deg=reversal_threshold_deg,
+        )
+        if reversal is None:
+            continue
+
+        reversal_idx, approach_heading, departure_heading, signed_delta = reversal
+        if dead_end_context and next_run is not None:
+            for boundary_idx, source_kind in ((run.start_idx, "dead_end_entry"), (next_run.start_idx, "dead_end_exit")):
+                boundary_candidate = boundary_map.get(boundary_idx)
+                if boundary_candidate is None or boundary_candidate.is_roundabout:
+                    continue
+                boundary_candidate.emit = True
+                boundary_candidate.forced_emit = True
+                boundary_candidate.reversal_detected = True
+                boundary_candidate.source_kind = source_kind
+                boundary_candidate.suppressed_reason = None
+                boundary_candidate.reason = f"emit: {source_kind.replace('_', ' ')}"
+
+        updated.append(
+            ManeuverCandidate(
+                candidate_index=len(updated),
+                maneuver_idx=reversal_idx,
+                boundary_idx=reversal_idx,
+                exit_idx=reversal_idx,
+                road_from=run.name,
+                road_to=run.name,
+                highway_from=run.highway,
+                highway_to=run.highway,
+                approach_heading=approach_heading,
+                departure_heading=departure_heading,
+                signed_delta=signed_delta,
+                maneuver_type="turn",
+                modifier="uturn",
+                instruction=format_instruction("turn", "uturn", run.name, run.name, locale),
+                step_name=run.name,
+                emit=True,
+                reason="emit: dead-end reversal" if dead_end_context else "emit: reversal",
+                is_roundabout=False,
+                roundabout_exit=None,
+                source_kind="dead_end_reversal" if dead_end_context else "reversal",
+                forced_emit=True,
+                reversal_detected=True,
+                suppressed_reason=None,
+            )
+        )
+
+    updated.sort(key=lambda candidate: (candidate.maneuver_idx, 0 if candidate.source_kind == "dead_end_reversal" else -1))
+    for candidate_index, candidate in enumerate(updated):
+        candidate.candidate_index = candidate_index
+    return updated
 
 
 def validate_polyline_string(value: str, label: str) -> None:
@@ -1160,6 +1324,10 @@ def write_debug_artifacts(
                 "road_from",
                 "road_to",
                 "emit",
+                "forced_emit",
+                "source_kind",
+                "reversal_detected",
+                "suppressed_reason",
                 "reason",
             ]
         )
@@ -1179,6 +1347,10 @@ def write_debug_artifacts(
                     m.road_from,
                     m.road_to,
                     str(m.emit).lower(),
+                    str(m.forced_emit).lower(),
+                    m.source_kind,
+                    str(m.reversal_detected).lower(),
+                    m.suppressed_reason or "",
                     m.reason,
                 ]
             )
@@ -1210,6 +1382,10 @@ def write_debug_artifacts(
                     "road_from": m.road_from,
                     "road_to": m.road_to,
                     "emit": m.emit,
+                    "forced_emit": m.forced_emit,
+                    "source_kind": m.source_kind,
+                    "reversal_detected": m.reversal_detected,
+                    "suppressed_reason": m.suppressed_reason,
                     "reason": m.reason,
                 },
                 "geometry": {"type": "Point", "coordinates": [points[m.maneuver_idx][1], points[m.maneuver_idx][0]]},
@@ -1265,6 +1441,12 @@ def build_route_json(
         locale=locale,
         continue_threshold_deg=continue_threshold_deg,
         turn_threshold_deg=turn_threshold_deg,
+    )
+    candidates = detect_dead_end_reversals(
+        candidates=candidates,
+        runs=runs,
+        points=points,
+        locale=locale,
     )
     emitted_candidates = [candidate for candidate in candidates if candidate.emit]
 
