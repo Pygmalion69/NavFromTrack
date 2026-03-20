@@ -826,9 +826,34 @@ def build_maneuver_candidates(
             i = next_idx
             continue
 
+        # Determine the maneuver index at the start of the current run
         maneuver_idx = run.start_idx
-        approach_heading = heading_around_index(points, cumulative, maneuver_idx, heading_window_m, forward=False)
-        departure_heading = heading_around_index(points, cumulative, maneuver_idx, heading_window_m, forward=True)
+
+        # Compute distances along the previous and current runs
+        try:
+            prev_run_distance = point_distance_sum(points, prev_run.start_idx, prev_run.end_idx)
+        except Exception:
+            prev_run_distance = 0.0
+
+        try:
+            run_distance = point_distance_sum(points, run.start_idx, run.end_idx)
+        except Exception:
+            run_distance = 0.0
+
+        # Dynamic heading windows (critical fix)
+        back_window = heading_window_m
+        if prev_run_distance > 0.0:
+            back_window = min(heading_window_m, prev_run_distance / 2.0)
+
+        forward_window = heading_window_m
+        if run_distance > 0.0:
+            forward_window = min(heading_window_m, run_distance / 2.0)
+
+        # Compute headings
+        approach_heading = heading_around_index(points, cumulative, maneuver_idx, back_window, forward=False)
+        departure_heading = heading_around_index(points, cumulative, maneuver_idx, forward_window, forward=True)
+
+        # Angle delta
         signed_delta = smallest_signed_angle(float(departure_heading - approach_heading))
         abs_delta = abs(signed_delta)
         same_road = same_road_identity(prev_run, run)
