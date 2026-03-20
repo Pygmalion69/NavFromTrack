@@ -1102,6 +1102,7 @@ def write_debug_artifacts(
     runs: List[Run],
     candidates: List[ManeuverCandidate],
     points: List[Tuple[float, float]],
+    route: Dict,
 ) -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1192,6 +1193,33 @@ def write_debug_artifacts(
         ],
     }
     (debug_dir / "maneuvers.geojson").write_text(json.dumps(maneuvers_geojson, indent=2), encoding="utf-8")
+
+    instruction_features = []
+    for step_index, step in enumerate(route.get("legs", [{}])[0].get("steps", [])):
+        maneuver = step.get("maneuver", {})
+        location = maneuver.get("location")
+        if not (isinstance(location, list) and len(location) == 2):
+            continue
+        instruction_features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "step_index": step_index,
+                    "type": maneuver.get("type"),
+                    "modifier": maneuver.get("modifier"),
+                    "instruction": maneuver.get("instruction", ""),
+                    "name": step.get("name", ""),
+                    "distance": step.get("distance", 0.0),
+                    "duration": step.get("duration", 0.0),
+                    "bearing_before": maneuver.get("bearing_before"),
+                    "bearing_after": maneuver.get("bearing_after"),
+                    "exit": maneuver.get("exit"),
+                },
+                "geometry": {"type": "Point", "coordinates": location},
+            }
+        )
+    instructions_geojson = {"type": "FeatureCollection", "features": instruction_features}
+    (debug_dir / "instructions.geojson").write_text(json.dumps(instructions_geojson, indent=2), encoding="utf-8")
 
 
 def build_route_json(
@@ -1427,7 +1455,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             f.write(serialized)
 
         if args.debug_dir is not None:
-            write_debug_artifacts(args.debug_dir, matches, runs, candidate_debug, points)
+            write_debug_artifacts(args.debug_dir, matches, runs, candidate_debug, points, route_json)
 
         return 0
 
