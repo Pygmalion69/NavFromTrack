@@ -9,7 +9,7 @@ Offline converter for creating a Mapbox Directions API-style route JSON from:
 ## Usage
 
 ```bash
-python gpx_osm_to_directions.py \
+python main.py \
   --gpx data/rpp_route.gpx \
   --osm data/area.osm \
   --out data/route.json \
@@ -17,6 +17,9 @@ python gpx_osm_to_directions.py \
   --locale en \
   --geometries polyline6
 ```
+
+`main.py` is the project entry point. `gpx_osm_to_directions.py` remains the
+implementation module that contains the actual converter CLI and logic.
 
 ## Arguments
 
