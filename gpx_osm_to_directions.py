@@ -1032,17 +1032,21 @@ def detect_dead_end_reversals(
             continue
 
         reversal_idx, approach_heading, departure_heading, signed_delta = reversal
-        if dead_end_context and next_run is not None:
-            for boundary_idx, source_kind in ((run.start_idx, "dead_end_entry"), (next_run.start_idx, "dead_end_exit")):
+        # Emit entry/exit maneuvers for any detected reversal so the caller can
+        # surface leaving the reversed segment even when the surrounding road
+        # context is not a strict dead end.
+        if next_run is not None:
+            context_prefix = "dead_end" if dead_end_context else "reversal"
+            for boundary_idx, suffix in ((run.start_idx, "entry"), (next_run.start_idx, "exit")):
                 boundary_candidate = boundary_map.get(boundary_idx)
                 if boundary_candidate is None or boundary_candidate.is_roundabout:
                     continue
                 boundary_candidate.emit = True
                 boundary_candidate.forced_emit = True
                 boundary_candidate.reversal_detected = True
-                boundary_candidate.source_kind = source_kind
+                boundary_candidate.source_kind = f"{context_prefix}_{suffix}"
                 boundary_candidate.suppressed_reason = None
-                boundary_candidate.reason = f"emit: {source_kind.replace('_', ' ')}"
+                boundary_candidate.reason = f"emit: {context_prefix} {suffix}"
 
         updated.append(
             ManeuverCandidate(
